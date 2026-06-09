@@ -41,6 +41,22 @@ fn bigstore_ok(dir: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
+/// Run git-bigstore feeding `input` on stdin (for the LFS adapter protocol).
+fn bigstore_stdin(dir: &Path, args: &[&str], input: &[u8]) -> std::process::Output {
+    use std::io::Write;
+    let bin = env!("CARGO_BIN_EXE_git-bigstore");
+    let mut child = Command::new(bin)
+        .args(args)
+        .current_dir(dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn git-bigstore {}: {e}", args.join(" ")));
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    child.wait_with_output().unwrap()
+}
+
 struct TestRepo {
     repo_dir: PathBuf,
     storage_dir: PathBuf,
@@ -336,6 +352,39 @@ fn full_lifecycle_push_pull_with_verification() {
 }
 
 #[test]
+fn large_file_multipart_round_trip() {
+    let t = TestRepo::new();
+
+    t.write_file(".gitattributes", b"*.bin filter=bigstore\n");
+    git(&t.repo_dir, &["add", ".gitattributes", ".bigstore.toml"]);
+    git(&t.repo_dir, &["commit", "-m", "init"]);
+
+    // 20 MiB of non-uniform content forces several multipart parts (chunk = 8 MiB).
+    let mut content = vec![0u8; 20 * 1024 * 1024];
+    for (i, b) in content.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    t.write_file("big.bin", &content);
+    git(&t.repo_dir, &["add", "big.bin"]);
+    git(&t.repo_dir, &["commit", "-m", "add big"]);
+
+    bigstore_ok(&t.repo_dir, &["push"]);
+
+    // Simulate a fresh clone: drop the local cache so pull must re-download
+    // from the remote, then replace the working tree with the pointer.
+    let cache_dir = t.repo_dir.join(".git/bigstore");
+    std::fs::remove_dir_all(&cache_dir).unwrap();
+    let pointer = git(&t.repo_dir, &["show", "HEAD:big.bin"]);
+    t.write_file("big.bin", pointer.as_bytes());
+
+    bigstore_ok(&t.repo_dir, &["pull"]);
+
+    let restored = t.read_file("big.bin");
+    assert_eq!(restored.len(), content.len(), "size mismatch after multipart round-trip");
+    assert_eq!(restored, content, "content mismatch after multipart round-trip");
+}
+
+#[test]
 fn push_is_idempotent() {
     let t = TestRepo::new();
 
@@ -460,6 +509,28 @@ fn status_verify_detects_corrupted_cache() {
     assert!(
         stderr.contains("corrupted"),
         "should suggest repair: {stderr}"
+    );
+}
+
+#[test]
+fn rejects_invalid_gitattributes_glob() {
+    let t = TestRepo::new();
+
+    // An unclosed character class is not a valid glob. Previously this silently
+    // fell back to matching every file; it must now surface an error.
+    t.write_file(".gitattributes", b"[ filter=bigstore\n");
+    git(&t.repo_dir, &["add", ".gitattributes", ".bigstore.toml"]);
+    git(&t.repo_dir, &["commit", "-m", "init"]);
+
+    let output = bigstore(&t.repo_dir, &["status"]);
+    assert!(
+        !output.status.success(),
+        "invalid .gitattributes glob should fail, not match everything"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid pattern"),
+        "should report the bad pattern: {stderr}"
     );
 }
 
@@ -1432,5 +1503,180 @@ fn import_dvc_dir_suggests_directory_scoped_gitattributes() {
     assert!(
         stderr.contains("my-models/** filter=bigstore"),
         "should suggest directory-scoped pattern, not per-file: {stderr}"
+    );
+}
+
+// ──────────────────────────────────────────────────
+// LFS transfer adapter tests
+// ──────────────────────────────────────────────────
+
+/// Set up a tracked object pushed to local storage and return its SHA-256 oid.
+fn push_object_for_lfs(t: &TestRepo, content: &[u8]) -> String {
+    t.write_file(".gitattributes", b"*.bin filter=bigstore\n");
+    git(&t.repo_dir, &["add", ".gitattributes", ".bigstore.toml"]);
+    git(&t.repo_dir, &["commit", "-m", "init"]);
+
+    t.write_file("obj.bin", content);
+    git(&t.repo_dir, &["add", "obj.bin"]);
+    git(&t.repo_dir, &["commit", "-m", "add"]);
+    bigstore_ok(&t.repo_dir, &["push"]);
+
+    // The committed pointer's third line is the SHA-256 oid.
+    let pointer = git(&t.repo_dir, &["show", "HEAD:obj.bin"]);
+    pointer.lines().nth(2).unwrap().to_string()
+}
+
+fn lfs_protocol(oid: &str, size: usize) -> String {
+    format!(
+        "{{\"event\":\"init\",\"operation\":\"download\",\"remote\":\"origin\",\"concurrent\":true,\"concurrenttransfers\":1}}\n\
+         {{\"event\":\"download\",\"oid\":\"{oid}\",\"size\":{size}}}\n\
+         {{\"event\":\"terminate\"}}\n"
+    )
+}
+
+fn lfs_upload_protocol(oid: &str, size: usize, path: &str) -> String {
+    format!(
+        "{{\"event\":\"init\",\"operation\":\"upload\",\"remote\":\"origin\",\"concurrent\":true,\"concurrenttransfers\":1}}\n\
+         {{\"event\":\"upload\",\"oid\":\"{oid}\",\"size\":{size},\"path\":\"{path}\"}}\n\
+         {{\"event\":\"terminate\"}}\n"
+    )
+}
+
+fn storage_object_count(t: &TestRepo) -> usize {
+    walkdir::WalkDir::new(&t.storage_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .count()
+}
+
+#[test]
+fn lfs_adapter_downloads_and_verifies() {
+    let t = TestRepo::new();
+    let content = b"lfs adapter content for verification\n";
+    let oid = push_object_for_lfs(&t, content);
+
+    let out = bigstore_stdin(
+        &t.repo_dir,
+        &["lfs-adapter"],
+        lfs_protocol(&oid, content.len()).as_bytes(),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // A "complete" event carrying a path and no error means the download
+    // passed verify_download (which runs before the event is emitted). The
+    // temp file lives in a private dir cleaned up on process exit — real LFS
+    // reads it before sending "terminate", so we don't read it post-exit here.
+    let complete = stdout
+        .lines()
+        .find(|l| l.contains("\"event\":\"complete\""))
+        .unwrap_or_else(|| panic!("no complete event: {stdout}"));
+    assert!(!complete.contains("\"error\""), "good object should not error: {complete}");
+
+    let v: serde_json::Value = serde_json::from_str(complete).unwrap();
+    assert!(
+        v["path"].as_str().is_some(),
+        "complete event should carry a path: {complete}"
+    );
+}
+
+#[test]
+fn lfs_adapter_rejects_corrupted_object() {
+    let t = TestRepo::new();
+    let content = b"lfs adapter content to be corrupted\n";
+    let oid = push_object_for_lfs(&t, content);
+
+    // Corrupt the object in remote storage (under files/sha256/...).
+    let sha_dir = t.storage_dir.join("files/sha256");
+    let mut corrupted = false;
+    for entry in walkdir::WalkDir::new(&sha_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        std::fs::write(entry.path(), b"not the real bytes").unwrap();
+        corrupted = true;
+    }
+    assert!(corrupted, "should have found the stored object to corrupt");
+
+    let out = bigstore_stdin(
+        &t.repo_dir,
+        &["lfs-adapter"],
+        lfs_protocol(&oid, content.len()).as_bytes(),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    let complete = stdout
+        .lines()
+        .find(|l| l.contains("\"event\":\"complete\""))
+        .unwrap_or_else(|| panic!("no complete event: {stdout}"));
+    assert!(
+        complete.contains("\"error\"") && complete.contains("integrity"),
+        "corrupted object must fail the integrity check: {complete}"
+    );
+}
+
+#[test]
+fn lfs_adapter_uploads_verified() {
+    let t = TestRepo::new();
+    t.write_file(".gitattributes", b"*.bin filter=bigstore\n");
+    git(&t.repo_dir, &["add", ".gitattributes", ".bigstore.toml"]);
+    git(&t.repo_dir, &["commit", "-m", "init"]);
+
+    // `git add` runs the clean filter: it caches the object and stages a pointer
+    // whose third line is the SHA-256 oid. The working tree keeps real content.
+    let content = b"valid lfs upload content\n";
+    t.write_file("up.bin", content);
+    git(&t.repo_dir, &["add", "up.bin"]);
+    let pointer = git(&t.repo_dir, &["show", ":up.bin"]);
+    let oid = pointer.lines().nth(2).unwrap().to_string();
+    let src = t.repo_dir.join("up.bin");
+
+    assert_eq!(storage_object_count(&t), 0, "storage should start empty");
+
+    let out = bigstore_stdin(
+        &t.repo_dir,
+        &["lfs-adapter"],
+        lfs_upload_protocol(&oid, content.len(), src.to_str().unwrap()).as_bytes(),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    let complete = stdout
+        .lines()
+        .find(|l| l.contains("\"event\":\"complete\""))
+        .unwrap_or_else(|| panic!("no complete event: {stdout}"));
+    assert!(!complete.contains("\"error\""), "valid upload should not error: {complete}");
+    assert_eq!(storage_object_count(&t), 1, "verified upload should write one object");
+}
+
+#[test]
+fn lfs_adapter_rejects_upload_oid_mismatch() {
+    let t = TestRepo::new();
+
+    // A file whose bytes do not hash to the claimed (syntactically valid) oid.
+    let content = b"payload that does not match the claimed oid\n";
+    t.write_file("bad-up.bin", content);
+    let src = t.repo_dir.join("bad-up.bin");
+    let wrong_oid = "0".repeat(64);
+
+    let out = bigstore_stdin(
+        &t.repo_dir,
+        &["lfs-adapter"],
+        lfs_upload_protocol(&wrong_oid, content.len(), src.to_str().unwrap()).as_bytes(),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    let complete = stdout
+        .lines()
+        .find(|l| l.contains("\"event\":\"complete\""))
+        .unwrap_or_else(|| panic!("no complete event: {stdout}"));
+    assert!(
+        complete.contains("\"error\"") && complete.contains("integrity"),
+        "upload with mismatched oid must fail the integrity check: {complete}"
+    );
+    assert_eq!(
+        storage_object_count(&t),
+        0,
+        "a mismatched upload must not poison storage"
     );
 }

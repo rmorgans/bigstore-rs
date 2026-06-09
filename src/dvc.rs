@@ -22,7 +22,7 @@ struct DvcOut {
 pub fn parse_dvc_pointer(path: &Path) -> Result<(Pointer, String)> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    let dvc_file: DvcFile = serde_yaml::from_str(&content)
+    let dvc_file: DvcFile = serde_yaml_ng::from_str(&content)
         .with_context(|| format!("failed to parse {}", path.display()))?;
 
     anyhow::ensure!(
@@ -65,7 +65,7 @@ pub enum DvcKind {
 pub fn parse_dvc_file(path: &Path) -> Result<DvcKind> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    let dvc_file: DvcFile = serde_yaml::from_str(&content)
+    let dvc_file: DvcFile = serde_yaml_ng::from_str(&content)
         .with_context(|| format!("failed to parse {}", path.display()))?;
 
     anyhow::ensure!(

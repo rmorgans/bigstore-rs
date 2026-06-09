@@ -19,7 +19,7 @@ pub fn repo_root() -> Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
-fn config_get(key: &str) -> Option<String> {
+pub fn config_get(key: &str) -> Option<String> {
     let output = std::process::Command::new("git")
         .args(["config", "--get", key])
         .output()
