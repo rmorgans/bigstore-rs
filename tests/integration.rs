@@ -73,7 +73,7 @@ impl TestRepo {
         std::fs::create_dir_all(&storage_dir).unwrap();
 
         // Init git repo
-        git(&repo_dir, &["init"]);
+        git(&repo_dir, &["init", "-b", "main"]);
         git(&repo_dir, &["config", "user.email", "test@test.com"]);
         git(&repo_dir, &["config", "user.name", "Test"]);
 
@@ -194,7 +194,7 @@ fn bare_test_repo() -> (tempfile::TempDir, PathBuf, PathBuf) {
     std::fs::create_dir_all(&repo_dir).unwrap();
     std::fs::create_dir_all(&storage_dir).unwrap();
 
-    git(&repo_dir, &["init"]);
+    git(&repo_dir, &["init", "-b", "main"]);
     git(&repo_dir, &["config", "user.email", "test@test.com"]);
     git(&repo_dir, &["config", "user.name", "Test"]);
 
@@ -1225,7 +1225,7 @@ fn log_root_commit_with_bigstore_file() {
     std::fs::create_dir_all(&repo_dir).unwrap();
     std::fs::create_dir_all(&storage_dir).unwrap();
 
-    git(&repo_dir, &["init"]);
+    git(&repo_dir, &["init", "-b", "main"]);
     git(&repo_dir, &["config", "user.email", "test@test.com"]);
     git(&repo_dir, &["config", "user.name", "Test"]);
 
