@@ -123,6 +123,14 @@ impl Pointer {
         let hexdigest_str = lines.next().context("pointer missing hexdigest")?;
         let hexdigest = Hexdigest::new(hexdigest_str, hash_fn)?;
 
+        // A valid pointer is exactly three lines. Reject any trailing
+        // non-whitespace line so a blob that merely starts like a pointer isn't
+        // accepted (and then round-tripped unchanged by the idempotent clean
+        // filter). Blank trailing lines are tolerated; content after one is not.
+        if let Some(extra) = lines.find(|l| !l.trim().is_empty()) {
+            anyhow::bail!("pointer has unexpected trailing content: {extra:?}");
+        }
+
         Ok(Some(Self::new(hash_fn, hexdigest)))
     }
 }
@@ -305,6 +313,29 @@ mod tests {
     fn pointer_rejects_short_digest() {
         let data = b"bigstore\nsha256\ndeadbeef\n";
         assert!(Pointer::parse(data).is_err());
+    }
+
+    #[test]
+    fn pointer_rejects_trailing_content() {
+        let hex = "ab".repeat(32);
+        let data = format!("bigstore\nsha256\n{hex}\nextra junk\n");
+        assert!(Pointer::parse(data.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn pointer_allows_trailing_blank_line() {
+        let hex = "ab".repeat(32);
+        let data = format!("bigstore\nsha256\n{hex}\n\n");
+        assert!(Pointer::parse(data.as_bytes()).unwrap().is_some());
+    }
+
+    #[test]
+    fn pointer_rejects_content_after_blank_line() {
+        // A blank line must not let later content slip past the trailing-content
+        // guard.
+        let hex = "ab".repeat(32);
+        let data = format!("bigstore\nsha256\n{hex}\n\npayload\n");
+        assert!(Pointer::parse(data.as_bytes()).is_err());
     }
 
     // Layout tests

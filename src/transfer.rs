@@ -119,6 +119,7 @@ async fn download_one(
     // Step 3: Exists on remote?
     let remote_key = cfg.remote_object_key(&pointer.hexdigest, pointer.hash_fn)?;
     if !backend::exists(store, &remote_key).await? {
+        pb.inc(1);
         return Ok(DownloadOutcome::NotFound);
     }
 
@@ -175,7 +176,7 @@ async fn download_and_verify(
             backend::download(store, remote_key, tmp_dl.path()).await?;
 
             let mut file = std::fs::File::open(tmp_dl.path())?;
-            let mut buf = [0u8; 64 * 1024];
+            let mut buf = vec![0u8; 64 * 1024];
             loop {
                 let n = std::io::Read::read(&mut file, &mut buf)?;
                 if n == 0 {
@@ -243,6 +244,7 @@ async fn upload_one(
 
     // Step 2: In local cache?
     if !cache_path.exists() {
+        pb.inc(1);
         return Ok(UploadOutcome::NotCached);
     }
 
@@ -431,7 +433,7 @@ impl Hasher {
 pub fn hash_file(path: &Path, hash_fn: HashFunction) -> Result<Hexdigest> {
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Hasher::new(hash_fn);
-    let mut buf = [0u8; 64 * 1024];
+    let mut buf = vec![0u8; 64 * 1024];
     loop {
         let n = std::io::Read::read(&mut file, &mut buf)?;
         if n == 0 {

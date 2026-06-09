@@ -5,13 +5,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use bigstore::{backend, config, types};
-
-mod cache;
-mod dvc;
-mod filter;
-mod git;
-mod transfer;
+use bigstore::{cache, config, dvc, filter, git, transfer, types};
 
 #[derive(Parser)]
 #[command(name = "git-bigstore", version, about = "Large files in git, your bucket, one binary.", long_about = None)]
@@ -137,10 +131,10 @@ async fn async_main(cli: Cli) -> Result<()> {
         .init();
 
     match cli.command {
-        Commands::Init { url, endpoint } => cmd_init(&url, endpoint.as_deref()).await,
+        Commands::Init { url, endpoint } => cmd_init(&url, endpoint.as_deref()),
         Commands::Push { patterns, jobs } => cmd_push(&patterns, jobs).await,
         Commands::Pull { patterns, jobs } => cmd_pull(&patterns, jobs).await,
-        Commands::Status { verify } => cmd_status(verify).await,
+        Commands::Status { verify } => cmd_status(verify),
         Commands::MigrateConfig { force } => cmd_migrate_config(force),
         Commands::Log { paths } => cmd_log(&paths),
         Commands::Ref { source, dest } => cmd_ref(&source, &dest),
@@ -157,7 +151,7 @@ async fn async_main(cli: Cli) -> Result<()> {
     }
 }
 
-async fn cmd_init(url: &str, endpoint: Option<&str>) -> Result<()> {
+fn cmd_init(url: &str, endpoint: Option<&str>) -> Result<()> {
     let git_dir = git::git_dir()?;
     let repo_root = git::repo_root()?;
 
@@ -215,7 +209,7 @@ async fn cmd_pull(patterns: &[String], jobs: Option<usize>) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_status(verify: bool) -> Result<()> {
+fn cmd_status(verify: bool) -> Result<()> {
     let repo_root = git::repo_root()?;
     let git_dir = git::git_dir()?;
     let _cfg = config::BigstoreConfig::find_and_load(&repo_root)?;
@@ -234,11 +228,13 @@ async fn cmd_status(verify: bool) -> Result<()> {
 
                 if verify && cached {
                     match transfer::hash_file(&cache_path, p.hash_fn) {
-                        Ok(actual) if actual == p.hexdigest => match (true, smudged) {
-                            (true, true) => "ok (verified)",
-                            (true, false) => "cached (not checked out, verified)",
-                            _ => unreachable!(),
-                        },
+                        Ok(actual) if actual == p.hexdigest => {
+                            if smudged {
+                                "ok (verified)"
+                            } else {
+                                "cached (not checked out, verified)"
+                            }
+                        }
                         Ok(_) => {
                             corrupted.push(path.clone());
                             "CORRUPTED (hash mismatch)"
@@ -322,8 +318,12 @@ fn cmd_log(paths: &[String]) -> Result<()> {
     // Optional path filter matchers
     let path_matchers: Vec<_> = paths
         .iter()
-        .filter_map(|p| Glob::new(p).ok().map(|g| g.compile_matcher()))
-        .collect();
+        .map(|p| {
+            Glob::new(p)
+                .with_context(|| format!("invalid path pattern: {p:?}"))
+                .map(|g| g.compile_matcher())
+        })
+        .collect::<Result<_>>()?;
 
     // Single long-lived process for all blob reads
     let mut cat_file = CatFileBatch::start()?;
@@ -570,15 +570,38 @@ impl CatFileBatch {
             .and_then(|(_, s)| s.parse().ok())
             .context("failed to parse cat-file header")?;
 
-        // Read content + trailing newline.
-        // Pointers are ~81 bytes. For tracked files, blobs are always pointers
-        // (clean filter ensures this), so size is always small.
-        let mut buf = vec![0u8; size + 1]; // +1 for trailing LF
-        std::io::Read::read_exact(&mut self.stdout, &mut buf)?;
-        buf.truncate(size); // drop trailing LF
+        // A bigstore pointer is ~81 bytes. `log` walks every changed blob in
+        // history — including large non-bigstore blobs — so read only enough to
+        // recognize a pointer and drain the rest of the blob (+ trailing LF)
+        // without buffering it. This bounds memory to MAX_POINTER_BYTES per blob
+        // while keeping the shared cat-file pipe byte-aligned.
+        let head_len = size.min(MAX_POINTER_BYTES);
+        let mut head = vec![0u8; head_len];
+        std::io::Read::read_exact(&mut self.stdout, &mut head)?;
+        discard_exact(&mut self.stdout, (size + 1) - head_len)?; // remainder + trailing LF
 
-        Ok(types::Pointer::parse(&buf).ok().flatten())
+        if size > MAX_POINTER_BYTES {
+            // Too large to be a pointer; pipe is already resynced.
+            return Ok(None);
+        }
+        Ok(types::Pointer::parse(&head).ok().flatten())
     }
+}
+
+/// Upper bound on a bigstore pointer's size. Real pointers are ~81 bytes; this
+/// leaves generous headroom while capping per-blob memory in `log`.
+const MAX_POINTER_BYTES: usize = 512;
+
+/// Read and discard exactly `n` bytes, keeping a shared pipe byte-aligned
+/// without buffering the skipped data.
+fn discard_exact(reader: &mut impl std::io::Read, mut n: usize) -> Result<()> {
+    let mut scratch = [0u8; 16 * 1024];
+    while n > 0 {
+        let take = n.min(scratch.len());
+        reader.read_exact(&mut scratch[..take])?;
+        n -= take;
+    }
+    Ok(())
 }
 
 impl Drop for CatFileBatch {
@@ -926,17 +949,20 @@ fn tracked_files(repo_root: &Path, patterns: &[String]) -> Result<Vec<(String, S
     let attr_matchers: Vec<_> = filter_patterns
         .iter()
         .map(|(pattern, filter_name)| {
-            let matcher = Glob::new(pattern)
-                .unwrap_or_else(|_| Glob::new("*").unwrap())
-                .compile_matcher();
-            (matcher, filter_name.clone())
+            let glob = Glob::new(pattern)
+                .with_context(|| format!("invalid pattern in .gitattributes: {pattern:?}"))?;
+            Ok((glob.compile_matcher(), filter_name.clone()))
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
     let user_matchers: Vec<_> = patterns
         .iter()
-        .filter_map(|p| Glob::new(p).ok().map(|g| g.compile_matcher()))
-        .collect();
+        .map(|p| {
+            Glob::new(p)
+                .with_context(|| format!("invalid pattern: {p:?}"))
+                .map(|g| g.compile_matcher())
+        })
+        .collect::<Result<_>>()?;
 
     let output = std::process::Command::new("git")
         .args(["ls-files"])

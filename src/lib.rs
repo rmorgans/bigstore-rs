@@ -1,4 +1,9 @@
 pub mod backend;
+pub mod cache;
 pub mod config;
+pub mod dvc;
+pub mod filter;
+pub mod git;
 pub mod lfs_adapter;
+pub mod transfer;
 pub mod types;

@@ -37,7 +37,7 @@ pub fn clean() -> Result<()> {
     hasher.update(&first_line);
     tmp.write_all(&first_line)?;
 
-    let mut buf = [0u8; 64 * 1024];
+    let mut buf = vec![0u8; 64 * 1024];
     loop {
         let n = reader.read(&mut buf)?;
         if n == 0 {
@@ -171,7 +171,7 @@ pub fn parse_gitattributes(path: &Path) -> Result<Vec<(String, String)>> {
         if parts.len() >= 2 {
             for attr in &parts[1..] {
                 if let Some(filter_name) = attr.strip_prefix("filter=") {
-                    if filter_name == "bigstore" || filter_name == "bigstore-compress" {
+                    if filter_name == "bigstore" {
                         filters.push((parts[0].to_string(), filter_name.to_string()));
                     }
                 }

@@ -16,10 +16,10 @@
 //!   2. git config bigstore-lfs.url (fallback for LFS-only repos)
 
 use anyhow::{Context, Result};
-use crate::{backend, config, types};
+use crate::{backend, config, git, transfer, types};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::Path;
 
 // ──────────────────────────────────────────────────
 // LFS custom transfer protocol types
@@ -103,7 +103,7 @@ fn load_config() -> Result<AdapterConfig> {
 
 fn load_bigstore_config() -> Result<config::BigstoreConfig> {
     // Try .bigstore.toml first
-    if let Ok(repo_root) = git_repo_root() {
+    if let Ok(repo_root) = git::repo_root() {
         let toml_path = repo_root.join(".bigstore.toml");
         if toml_path.exists() {
             return config::BigstoreConfig::load(&toml_path);
@@ -111,32 +111,11 @@ fn load_bigstore_config() -> Result<config::BigstoreConfig> {
     }
 
     // Fallback: git config bigstore-lfs.*
-    let url = git_config_get("bigstore-lfs.url")
+    let url = git::config_get("bigstore-lfs.url")
         .context("no .bigstore.toml and no git config bigstore-lfs.url")?;
-    let endpoint = git_config_get("bigstore-lfs.endpoint");
+    let endpoint = git::config_get("bigstore-lfs.endpoint");
 
     config::BigstoreConfig::from_url(&url, endpoint.as_deref())
-}
-
-fn git_repo_root() -> Result<PathBuf> {
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()?;
-    anyhow::ensure!(output.status.success(), "not a git repository");
-    let path = String::from_utf8(output.stdout)?.trim().to_string();
-    Ok(PathBuf::from(path))
-}
-
-fn git_config_get(key: &str) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(["config", "--get", key])
-        .output()
-        .ok()?;
-    if output.status.success() {
-        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        None
-    }
 }
 
 // ──────────────────────────────────────────────────
@@ -169,22 +148,45 @@ fn send(w: &mut impl Write, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+/// Verify a file's contents against an LFS OID (a SHA-256 digest). Used on both
+/// sides: a corrupt download is never reported `complete`, and a mismatched
+/// upload is never written to content-addressed storage under the wrong key.
+/// Git LFS also verifies, but bigstore checks every transfer itself.
+fn verify_oid(path: &Path, oid: &str) -> Result<()> {
+    let expected = types::Hexdigest::new(oid, types::HashFunction::Sha256)?;
+    let actual = transfer::hash_file(path, types::HashFunction::Sha256)
+        .with_context(|| format!("failed to hash oid {oid}"))?;
+    anyhow::ensure!(
+        actual == expected,
+        "integrity check failed for oid {oid}: got {actual}"
+    );
+    Ok(())
+}
+
 fn handle_download(
     rt: &tokio::runtime::Runtime,
     cfg: &AdapterConfig,
     oid: &str,
+    work_dir: &Path,
     out: &mut impl Write,
 ) -> Result<()> {
     let key = oid_to_remote_key(cfg, oid)?;
 
-    let tmp_dir = std::env::temp_dir();
-    let tmp_path = tmp_dir.join(format!("bigstore-lfs-{oid}"));
+    // Private per-run directory (random name, cleaned up on exit) avoids the
+    // predictable shared-temp path the previous implementation used.
+    let tmp_path = work_dir.join(oid);
 
-    let result = rt.block_on(async {
-        backend::download(&cfg.backend, &key, &tmp_path)
-            .await
-            .with_context(|| format!("download failed for oid {oid}"))
-    });
+    let result = rt
+        .block_on(async {
+            backend::download(&cfg.backend, &key, &tmp_path)
+                .await
+                .with_context(|| format!("download failed for oid {oid}"))
+        })
+        .and_then(|()| verify_oid(&tmp_path, oid));
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
 
     match result {
         Ok(()) => {
@@ -242,11 +244,16 @@ fn handle_upload(
     let result: Result<()> = if already_exists {
         Ok(())
     } else {
-        let local_path = std::path::Path::new(path);
-        rt.block_on(async {
-            backend::upload(&cfg.backend, local_path, &key)
-                .await
-                .with_context(|| format!("upload failed for oid {oid}"))
+        let local_path = Path::new(path);
+        // Verify the bytes hash to the claimed OID before writing them to shared
+        // storage under that key — a mismatched upload would poison the bucket
+        // for every consumer (bigstore and LFS alike).
+        verify_oid(local_path, oid).and_then(|()| {
+            rt.block_on(async {
+                backend::upload(&cfg.backend, local_path, &key)
+                    .await
+                    .with_context(|| format!("upload failed for oid {oid}"))
+            })
         })
     };
 
@@ -305,6 +312,12 @@ pub fn run() -> Result<()> {
         .build()
         .context("failed to build tokio runtime")?;
 
+    // Private scratch dir for downloaded objects; removed when the adapter exits.
+    let work_dir = tempfile::Builder::new()
+        .prefix("bigstore-lfs-")
+        .tempdir()
+        .context("failed to create temp dir")?;
+
     let mut cfg: Option<AdapterConfig> = None;
 
     for line in reader.lines() {
@@ -337,7 +350,7 @@ pub fn run() -> Result<()> {
 
             "download" => {
                 let c = cfg.as_ref().expect("init must precede download");
-                handle_download(&rt, c, &event.oid, &mut stdout)?;
+                handle_download(&rt, c, &event.oid, work_dir.path(), &mut stdout)?;
             }
 
             "upload" => {

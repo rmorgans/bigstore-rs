@@ -5,11 +5,8 @@ use anyhow::Result;
 use object_store::ObjectStore;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
 
 use crate::config::{BackendConfig, BigstoreConfig};
-
-const UPLOAD_CHUNK_SIZE: usize = 8 * 1024 * 1024; // 8 MiB per part
 
 pub enum Backend {
     ObjectStore(Arc<dyn ObjectStore>),
@@ -46,25 +43,22 @@ pub async fn exists(backend: &Backend, key: &str) -> Result<bool> {
     }
 }
 
-/// Upload a local file to the remote. Streams in chunks — does not buffer entire file.
+/// Upload a local file to the remote. Streams — does not buffer the entire file.
 pub async fn upload(backend: &Backend, local_path: &Path, key: &str) -> Result<()> {
     match backend {
         Backend::ObjectStore(store) => {
+            use tokio::io::AsyncWriteExt;
+
             let path = object_store::path::Path::from(key);
-            let mut upload = store.put_multipart(&path).await?;
+            // BufWriter issues a single PUT for objects under its capacity and
+            // switches to multipart (10 MiB parts, safely above S3's 5 MiB
+            // minimum) above it — sizing parts correctly regardless of how the
+            // file reads back. A raw put_part loop would forward short reads
+            // verbatim and risk an EntityTooSmall rejection on complete().
+            let mut writer = object_store::buffered::BufWriter::new(Arc::clone(store), path);
             let mut file = tokio::fs::File::open(local_path).await?;
-
-            loop {
-                let mut buf = vec![0u8; UPLOAD_CHUNK_SIZE];
-                let n = file.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                buf.truncate(n);
-                upload.put_part(buf.into()).await?;
-            }
-
-            upload.complete().await?;
+            tokio::io::copy(&mut file, &mut writer).await?;
+            writer.shutdown().await?;
             Ok(())
         }
         Backend::Rclone(r) => r.upload(local_path, key),

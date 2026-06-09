@@ -1,0 +1,42 @@
+# cargo-deny configuration — supply-chain gate.
+#   cargo install cargo-deny
+#   cargo deny check
+#
+# Run in CI to fail on security advisories, yanked crates, disallowed
+# licenses, or dependencies from untrusted sources.
+
+[advisories]
+version = 2
+yanked = "deny"
+# Transitive advisories with no available fix. Remove each once object_store
+# (the sole path to both) ships a release that drops the dependency.
+ignore = [
+    # rustls-pemfile is unmaintained; pulled in only by object_store. No safe
+    # upgrade exists yet. Not a vulnerability.
+    "RUSTSEC-2025-0134",
+    # rand unsoundness only triggers with a custom global logger that calls
+    # rand::rng() during logging — not a pattern this crate uses.
+    "RUSTSEC-2026-0097",
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

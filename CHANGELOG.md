@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Upload now uses `object_store`'s `BufWriter`, which sizes multipart parts
+  correctly (single PUT for small objects, 10 MiB parts above). The previous
+  raw `put_part` loop could forward short reads as sub-5 MiB parts and risk an
+  `EntityTooSmall` rejection on large files.
+- `log` no longer buffers entire blobs into memory to check the pointer header;
+  it reads a bounded header and drains the rest, capping per-blob memory.
+- Invalid globs in `.gitattributes` and in CLI patterns now error instead of
+  silently matching everything (or nothing).
+- LFS adapter verifies every transfer against its OID — downloads before
+  reporting `complete`, uploads before writing to shared storage (so a corrupt
+  upload can't poison the bucket) — writes downloads to a private per-run temp
+  dir (no predictable shared path), and cleans up on failure.
+- `Pointer::parse` rejects any trailing non-whitespace content after the digest
+  line, including content that follows a blank line.
+- Push/pull progress bar now advances for skipped and not-found objects.
+
+### Changed
+
+- Core modules (`cache`, `dvc`, `filter`, `git`, `transfer`) moved into the
+  library crate; the binary is now a thin CLI shell. Removes duplicated git
+  helpers in the LFS adapter and makes the core unit-testable.
+- Replaced unmaintained `serde_yaml` (RUSTSEC-2024-0370) with `serde_yaml_ng`.
+- Bumped `object_store` to 0.12; updated `rustls-webpki` to clear four
+  advisories. Added `deny.toml` for `cargo deny` supply-chain gating.
+- Removed the unimplemented `bigstore-compress` filter recognition.
+
 ## 0.1.0
 
 First release. Validated against a real monorepo with 80 files across 5 ML
